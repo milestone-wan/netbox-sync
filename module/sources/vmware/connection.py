@@ -169,6 +169,11 @@ class VMWareHandler(SourceBase):
         self.parsing_vms_the_first_time = True
         self.objects_to_reevaluate = list()
         self.parsing_objects_to_reevaluate = False
+        # host_name -> {"site_name": str, "strong": bool, "cluster": NBCluster}
+        # strong=True means the site came from host_site_relation or a site-scoped prefix
+        self.host_site_resolutions = dict()
+        # cluster display key / object id -> True when cluster_site_relation or cluster_scope_* hit
+        self.cluster_scope_from_config = dict()
 
     @classmethod
     def get_interface_name_variants(cls, name):
@@ -713,6 +718,7 @@ class VMWareHandler(SourceBase):
                 "view_type": vim.HostSystem,
                 "view_handler": self.add_host
             },
+            # cluster scope from unanimous host sites is applied between hosts and VMs
             "virtual machine": {
                 "view_type": vim.VirtualMachine,
                 "view_handler": self.add_virtual_machine
@@ -780,6 +786,10 @@ class VMWareHandler(SourceBase):
                 view_details.get("view_handler")(obj)
 
             container_view.Destroy()
+
+            # after all hosts are known, patch clusters that had no config-based scope
+            if view_name == "host":
+                self.resolve_cluster_scopes_from_hosts()
 
         self.parsing_objects_to_reevaluate = True
         log.info("Parsing objects which were marked to be reevaluated")
@@ -850,7 +860,11 @@ class VMWareHandler(SourceBase):
     def get_site_name(self, object_type, object_name, cluster_name=""):
         """
         Return a site name for a NBCluster or NBDevice depending on config options
-        host_site_relation and cluster_site_relation
+        host_site_relation and cluster_site_relation.
+
+        For devices only host_site_relation is consulted. Cluster site no longer
+        overrides the host; callers that need the full host site (config, prefix,
+        or default) should use resolve_host_site().
 
         Parameters
         ----------
@@ -859,11 +873,12 @@ class VMWareHandler(SourceBase):
         object_name: str
             object name to check site relation for
         cluster_name: str
-            cluster name of NBDevice to check for site name
+            unused for devices (kept for call-site compatibility)
 
         Returns
         -------
-        str: site name if a relation was found
+        str: site name if a relation was found, else None for clusters;
+             for devices None when host_site_relation did not match
         """
 
         if object_type not in [NBCluster, NBDevice]:
@@ -871,27 +886,8 @@ class VMWareHandler(SourceBase):
 
         log.debug2(f"Trying to find site name for {object_type.name} '{object_name}'")
 
-        # check if site was provided in config
         relation_name = "host_site_relation" if object_type == NBDevice else "cluster_site_relation"
-
         site_name = self.get_object_relation(object_name, relation_name)
-
-        # check if cluster is in a different site than the host and override the site name if so
-        if object_type == NBDevice:
-            site_name = self.get_site_name(NBCluster, cluster_name)
-            if site_name is not None:
-                log.debug2(f"Found a matching cluster site for {object_name}, using site '{site_name}'. Overriding host site relation '{relation_name}'")
-            else:
-                site_name = self.get_object_relation(object_name, relation_name)
-                # set deault site name if no relation was found
-                if site_name is None:
-                    site_name = self.site_name
-                    log.debug2(f"No site relation for {type(object_name)}: '{object_name}' found, using default site '{site_name}'")
-
-        # set default site name for devices
-        if site_name is None and object_type == NBDevice:
-            site_name = self.site_name
-            log.debug(f"No site relation for '{object_name}' found, using default site '{site_name}'")
 
         # set the site for cluster to None if None-keyword ("<NONE>") is set via cluster_site_relation
         if object_type == NBCluster and site_name == "<NONE>":
@@ -901,6 +897,141 @@ class VMWareHandler(SourceBase):
         log.debug2(f"Returning site name '{site_name}' for {object_type.name} '{object_name}'.")
 
         return site_name
+
+    def resolve_host_site(self, host_name, primary_ip4=None, primary_ip6=None):
+        """
+        Resolve the NetBox site for an ESXi host.
+
+        Order: host_site_relation, then longest site-scoped prefix for the host
+        primary IP (IPv4 preferred, else IPv6), then the source default site.
+        A site from config or prefix is "strong"; the default site is not.
+
+        Parameters
+        ----------
+        host_name: str
+            ESXi host name as used in NetBox
+        primary_ip4: str | None
+            primary IPv4 as address or address/prefix
+        primary_ip6: str | None
+            primary IPv6 as address or address/prefix
+
+        Returns
+        -------
+        tuple: (site_name: str, strong: bool)
+        """
+
+        site_name = self.get_site_name(NBDevice, host_name)
+        if site_name is not None:
+            log.debug2(f"Host '{host_name}' site from host_site_relation: '{site_name}'")
+            return site_name, True
+
+        primary_ip = primary_ip4 or primary_ip6
+        if primary_ip is not None:
+            try:
+                ip_obj = ip_interface(primary_ip).ip if "/" in str(primary_ip) else ip_address(primary_ip)
+            except ValueError:
+                log.warning(f"Host '{host_name}' primary IP '{primary_ip}' is invalid for site lookup")
+                ip_obj = None
+
+            if ip_obj is not None:
+                matching_prefix = self.return_longest_site_scoped_prefix_for_ip(ip_obj)
+                if matching_prefix is not None:
+                    scope_site = matching_prefix.data.get("scope_id")
+                    if not isinstance(scope_site, NBSite):
+                        scope_site = matching_prefix.data.get("site")
+                    if isinstance(scope_site, NBSite):
+                        site_name = scope_site.get_display_name()
+                        log.debug2(
+                            f"Host '{host_name}' site from longest site-scoped prefix "
+                            f"for {ip_obj}: '{site_name}'"
+                        )
+                        return site_name, True
+
+        log.debug(f"No site relation or site-scoped prefix for host '{host_name}', "
+                  f"using default site '{self.site_name}'")
+        return self.site_name, False
+
+    def resolve_vm_site(self, parent_host_name, nb_cluster_object, cluster_full_name=""):
+        """
+        Resolve the site for a VM from its parent host, falling back to the cluster.
+
+        Returns
+        -------
+        tuple: (site_name or None, strong: bool)
+        """
+
+        host_resolution = getattr(self, "host_site_resolutions", {}).get(parent_host_name)
+        if host_resolution is not None and host_resolution.get("site_name"):
+            return host_resolution["site_name"], host_resolution.get("strong") is True
+
+        site_name = None
+        if nb_cluster_object is not None:
+            site_name = nb_cluster_object.get_site_name()
+        if site_name is None and cluster_full_name:
+            site_name = self.get_site_name(NBCluster, cluster_full_name)
+        return site_name, False
+
+    def resolve_cluster_scopes_from_hosts(self):
+        """
+        For clusters without a config-based site/scope, set scope from unanimous
+        strong host sites. Hosts whose site is only the source default do not vote.
+        If strong host sites disagree or none exist, leave the cluster scope empty.
+        """
+
+        if not hasattr(self, "host_site_resolutions"):
+            return
+
+        clusters = dict()
+        for host_name, resolution in self.host_site_resolutions.items():
+            cluster = resolution.get("cluster")
+            if cluster is None:
+                continue
+            clusters.setdefault(id(cluster), {"cluster": cluster, "sites": set()})
+            if resolution.get("strong") is True and resolution.get("site_name"):
+                clusters[id(cluster)]["sites"].add(resolution["site_name"])
+
+        for cluster_id, info in clusters.items():
+            cluster = info["cluster"]
+            if getattr(self, "cluster_scope_from_config", {}).get(cluster_id) is True:
+                log.debug2(
+                    f"Cluster '{cluster.get_display_name()}' scope comes from config; "
+                    "skipping host-based reconcile"
+                )
+                continue
+
+            strong_sites = info["sites"]
+            if len(strong_sites) == 1:
+                site_name = next(iter(strong_sites))
+                site_object = self.inventory.add_update_object(NBSite, data={"name": site_name})
+                log.info(
+                    f"Setting cluster '{cluster.get_display_name()}' site to '{site_name}' "
+                    f"from unanimous host site resolution"
+                )
+                if version.parse(self.inventory.netbox_api_version) >= version.parse("4.2.0"):
+                    cluster.update(
+                        data={"scope_type": "dcim.site", "scope_id": site_object},
+                        source=self,
+                    )
+                else:
+                    cluster.update(data={"site": site_object}, source=self)
+            else:
+                if len(strong_sites) > 1:
+                    log.warning(
+                        f"Cluster '{cluster.get_display_name()}' hosts resolve to different "
+                        f"sites ({', '.join(sorted(strong_sites))}); leaving cluster scope empty"
+                    )
+                else:
+                    log.debug2(
+                        f"Cluster '{cluster.get_display_name()}' has no strong host sites; "
+                        "leaving cluster scope empty"
+                    )
+                if version.parse(self.inventory.netbox_api_version) >= version.parse("4.2.0"):
+                    # clear any previously guessed site so a multi-site cluster stays unscoped
+                    if cluster.data.get("scope_type") is not None or cluster.data.get("scope_id") is not None:
+                        cluster.unset_attribute("scope_type")
+                        cluster.unset_attribute("scope_id")
+                elif cluster.data.get("site") is not None:
+                    cluster.unset_attribute("site")
 
     def get_scope_type(self, object_type, object_name):
         """
@@ -2013,11 +2144,16 @@ class VMWareHandler(SourceBase):
             scope_type = self.get_scope_type(NBCluster, name)
 
         site_name = self.get_site_name(NBCluster, full_cluster_name)
+        if site_name is None:
+            site_name = self.get_site_name(NBCluster, name)
 
         scope_id = self.get_scope_id(NBCluster, full_cluster_name)
         if scope_id is None:
             scope_id = self.get_scope_id(NBCluster, name)
         log.debug(f"Cluster '{full_cluster_name}' has scope id '{scope_id}' of type {type(scope_id)}.")
+
+        # remember whether config already decided the cluster scope (skip host-based reconcile)
+        scope_from_config = scope_type is not None or site_name is not None
 
         data = {
             "name": name,
@@ -2109,7 +2245,71 @@ class VMWareHandler(SourceBase):
         else:
             cluster_object = self.inventory.add_update_object(NBCluster, data=data, source=self)
 
+        if scope_from_config is True:
+            if not hasattr(self, "cluster_scope_from_config"):
+                self.cluster_scope_from_config = dict()
+            self.cluster_scope_from_config[id(cluster_object)] = True
+
         self.add_object_to_cache(obj, cluster_object)
+
+    def extract_host_primary_ips(self, obj, host_name):
+        """
+        Determine the host's primary IPv4/IPv6 from vmkernel adapters before site resolution.
+
+        Uses the same rules as the later vnic parsing: management-interface match or
+        default route, then the first address permitted by permitted_subnets.
+
+        Parameters
+        ----------
+        obj: vim.HostSystem
+            host object
+        host_name: str
+            host name used in log messages
+
+        Returns
+        -------
+        tuple: (primary_ipv4 or None, primary_ipv6 or None) as address/prefix strings
+        """
+
+        host_primary_ip4 = None
+        host_primary_ip6 = None
+
+        for vnic in grab(obj, "config.network.vnic", fallback=list()):
+            vnic_name = grab(vnic, "device")
+            vnic_portgroup = grab(vnic, "portgroup")
+            vnic_portgroup_data = self.network_data["host_pgroup"].get(host_name, {}).get(vnic_portgroup)
+            vnic_dv_portgroup_key = grab(vnic, "spec.distributedVirtualPort.portgroupKey")
+            vnic_dv_portgroup_data = self.network_data["dpgroup"].get(vnic_dv_portgroup_key)
+
+            vnic_description = ""
+            if vnic_portgroup_data is not None:
+                vnic_portgroup_vlan_id = vnic_portgroup_data.get("vlan_id")
+                vnic_vswitch = vnic_portgroup_data.get("vswitch")
+                vnic_description = f"{vnic_portgroup} ({vnic_vswitch}, vlan ID: {vnic_portgroup_vlan_id})"
+            elif vnic_dv_portgroup_data is not None:
+                vnic_description = vnic_dv_portgroup_data.get("name") or ""
+
+            vnic_is_primary = False
+            for management_match in self.settings.host_management_interface_match:
+                if management_match in f"{vnic_description}".lower():
+                    vnic_is_primary = True
+                    break
+
+            if grab(vnic, "spec.ipRouteSpec") is not None:
+                vnic_is_primary = True
+
+            int_v4 = "{}/{}".format(grab(vnic, "spec.ip.ipAddress"), grab(vnic, "spec.ip.subnetMask"))
+            if self.settings.permitted_subnets.permitted(int_v4, interface_name=vnic_name) is True:
+                if vnic_is_primary is True and host_primary_ip4 is None:
+                    host_primary_ip4 = int_v4
+
+            for ipv6_entry in grab(vnic, "spec.ip.ipV6Config.ipV6Address", fallback=list()):
+                int_v6 = "{}/{}".format(grab(ipv6_entry, "ipAddress"), grab(ipv6_entry, "prefixLength"))
+                if self.settings.permitted_subnets.permitted(int_v6, interface_name=vnic_name) is True:
+                    if vnic_is_primary is True and host_primary_ip6 is None:
+                        host_primary_ip6 = int_v6
+
+        return host_primary_ip4, host_primary_ip6
 
     def add_virtual_switch(self, obj):
         """
@@ -2252,26 +2452,14 @@ class VMWareHandler(SourceBase):
 
         cluster_name = get_string_or_none(grab(nb_cluster_object, "data.name"))
 
-        # get a site for this host
         if self.settings.set_source_name_as_cluster_group is True:
             group = self.inventory.get_by_data(NBClusterGroup, data={"name": self.name})
         else:
             group = self.get_object_from_cache(self.get_parent_object_by_class(obj, vim.Datacenter))
         group_name = grab(group, "data.name")
-        site_name = self.get_site_name(NBDevice, name, f"{group_name}/{cluster_name}")
+        cluster_full_name = f"{group_name}/{cluster_name}"
 
-        if name in self.processed_host_names.get(site_name, list()) and obj not in self.objects_to_reevaluate:
-            log.warning(f"Host '{name}' for site '{site_name}' already parsed. "
-                        "Make sure to use unique host names. Skipping")
-            return
-
-        # add host to processed list
-        if self.processed_host_names.get(site_name) is None:
-            self.processed_host_names[site_name] = list()
-
-        self.processed_host_names[site_name].append(name)
-
-        # filter hosts by name
+        # filter hosts by name (site is resolved after vmkernel / portgroup data is available)
         if self.passes_filter(name, self.settings.host_include_filter, self.settings.host_exclude_filter) is False:
             return
 
@@ -2337,7 +2525,7 @@ class VMWareHandler(SourceBase):
         # get vCenter tags
         host_tags.extend(self.collect_object_tags(obj))
 
-        # prepare host data model
+        # prepare host data model (site is filled after primary-IP based resolution below)
         host_data = {
             "name": name,
             "device_type": {
@@ -2346,7 +2534,6 @@ class VMWareHandler(SourceBase):
                     "name": manufacturer
                 }
             },
-            "site": {"name": site_name},
             "cluster": nb_cluster_object,
             "status": status
         }
@@ -2426,6 +2613,39 @@ class VMWareHandler(SourceBase):
                     "vswitch": unquote(grab(pgroup, "spec.vswitchName")),
                     "nics": pgroup_nics
                 }
+
+        # resolve site from host_site_relation or longest site-scoped prefix of the primary IP
+        host_primary_ip4_for_site, host_primary_ip6_for_site = self.extract_host_primary_ips(obj, name)
+        site_name, site_is_strong = self.resolve_host_site(
+            name, host_primary_ip4_for_site, host_primary_ip6_for_site
+        )
+        host_data["site"] = {"name": site_name}
+        self.host_site_resolutions[name] = {
+            "site_name": site_name,
+            "strong": site_is_strong,
+            "cluster": nb_cluster_object,
+        }
+
+        cluster_config_site = self.get_site_name(NBCluster, cluster_full_name)
+        if cluster_config_site is None:
+            cluster_config_site = self.get_site_name(NBCluster, cluster_name)
+        if cluster_config_site is not None and cluster_config_site != site_name:
+            log.warning(
+                f"Host '{name}' site '{site_name}' differs from cluster '{cluster_full_name}' "
+                f"config site '{cluster_config_site}'. Keeping both."
+            )
+
+        if name in self.processed_host_names.get(site_name, list()) and obj not in self.objects_to_reevaluate:
+            log.warning(f"Host '{name}' for site '{site_name}' already parsed. "
+                        "Make sure to use unique host names. Skipping")
+            return
+
+        if self.processed_host_names.get(site_name) is None:
+            self.processed_host_names[site_name] = list()
+        self.processed_host_names[site_name].append(name)
+
+        # track whether IP assignment must require a site-scoped prefix (no global fallback)
+        self._current_object_strict_site_prefix = site_is_strong
 
         # now iterate over all physical interfaces and collect data
         pnic_data_dict = dict()
@@ -2734,6 +2954,7 @@ class VMWareHandler(SourceBase):
             self.add_device_vm_to_inventory(NBDevice, object_data=host_data, pnic_data=pnic_data_dict,
                                             vnic_data=vnic_data_dict, nic_ips=vnic_ips,
                                             p_ipv4=host_primary_ip4, p_ipv6=host_primary_ip6, vmware_object=obj)
+        self._current_object_strict_site_prefix = False
 
         # add cables to the switch ports which were reported via CDP/LLDP
         if device_object is not None:
@@ -2833,6 +3054,9 @@ class VMWareHandler(SourceBase):
             return
 
         parent_name = grab(parent_host, "name")
+        if parent_name is not None and self.settings.strip_host_domain_name is True:
+            parent_name = parent_name.split(".")[0]
+
         cluster_name = grab(nb_cluster_object, "data.name")
         cluster_full_name = f"{group.name}/{cluster_name}"
 
@@ -2855,10 +3079,9 @@ class VMWareHandler(SourceBase):
         # Collect data
         #
 
-        # check if cluster is a Standalone ESXi
-        site_name = nb_cluster_object.get_site_name()
-        if site_name is None:
-            site_name = self.get_site_name(NBCluster, cluster_full_name)
+        site_name, site_is_strong = self.resolve_vm_site(parent_name, nb_cluster_object, cluster_full_name)
+        self._current_object_strict_site_prefix = site_is_strong
+        log.debug2(f"VM '{name}' resolved site '{site_name}' (strong={site_is_strong})")
 
         # first check against vm_platform_relation
         platform = get_string_or_none(grab(obj, "config.guestFullName"))
@@ -3301,6 +3524,7 @@ class VMWareHandler(SourceBase):
         self.add_device_vm_to_inventory(NBVM, object_data=vm_data, vnic_data=nic_data,
                                         nic_ips=nic_ips, p_ipv4=vm_primary_ip4, p_ipv6=vm_primary_ip6,
                                         vmware_object=obj, disk_data=disk_data)
+        self._current_object_strict_site_prefix = False
 
         return
 

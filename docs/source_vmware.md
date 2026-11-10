@@ -9,8 +9,16 @@ All options for this source are described in the [settings-example.ini](../setti
 
 If you have multiple vCenter instances just add another source with the same type in the **same** file.
 
-***IMPORTANT:*** For VMware source you should define the var `cluster_site_relation` which maps a vCenter cluster to an
-exiting Site in NetBox. If undefined a placeholder site will be created.
+***IMPORTANT:*** Site assignment prefers local relation config, then longest site-scoped IP prefix match:
+
+* Host site: `host_site_relation` → longest matching NetBox prefix scoped to a site for the host primary IP → default site `vCenter: <source name>`
+* Cluster site: `cluster_site_relation` / `cluster_scope_*_relation` when set; otherwise unanimous strong host sites (config or prefix). Disagreeing host sites leave the cluster unscoped (`<NONE>` equivalent)
+* `cluster_site_relation` no longer overrides host sites
+* VMs follow the parent host's resolved site (VLAN/interface/IP data use that site)
+
+Define `cluster_site_relation` and/or `host_site_relation` when prefix-based discovery is not enough.
+
+Keep live vCenter credentials out of git: use `settings.ini` (gitignored), `NBS_*` environment variables, or a secrets mount. Prefer dry-run (`-n`) and a temporary `cluster_include_filter` overlay when validating a single cluster.
 
 ### vCenter user
 You need a user account with "Read-only" role on vCenter root scope.

@@ -123,6 +123,8 @@ There are two ways to define configuration. Any combination of config file(s) an
 
 The config from the environment variables will have precedence over the config file definitions.
 
+**Security:** Do not commit `settings.ini`, API tokens, or passwords. Prefer `NBS_*` environment variables or mounted secrets for credentials. Local dry-run overlays (`settings-*-test.ini`) and `settings.local.ini` are gitignored.
+
 ### Config files
 Following config file types are supported:
 * ini

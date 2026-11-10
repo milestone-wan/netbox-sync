@@ -16,5 +16,7 @@ log/*
 # chache files
 cache/*
 
-# settings file
+# settings file (never commit live credentials or env-specific overlays)
 settings.ini
+settings.local.ini
+settings-*-test.ini

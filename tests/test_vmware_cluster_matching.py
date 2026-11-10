@@ -72,6 +72,8 @@ def _make_source(inventory, name, site=None, source_name_as_group=False):
     src.tag_session = None
     src.object_cache = {}
     src.recursion_level = 0
+    src.host_site_resolutions = {}
+    src.cluster_scope_from_config = {}
     src.settings = SimpleNamespace(
         set_source_name_as_cluster_group=source_name_as_group,
         strip_host_domain_name=False,
