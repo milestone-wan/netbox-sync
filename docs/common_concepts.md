@@ -1,5 +1,15 @@
 # Concepts of approaches to add different data to NetBox
 
+## Site resolution (VMware)
+
+ESXi host sites are resolved in this order:
+
+1. `host_site_relation`
+2. longest NetBox prefix whose scope is a concrete site and that contains the host primary IP (IPv4 preferred, else IPv6); global and site-group prefixes are ignored; equal-length matches in different sites count as no match
+3. default site `vCenter: <source name>`
+
+A site from (1) or (2) is a *strong* site. Clusters without a config site take the unanimous strong host site, or stay unscoped if hosts disagree. Virtual machines use the parent host site.
+
 ## IP addresses
 First they will be checked and added if all checks pass.
 * have to pass `permitted_subnets` config setting
@@ -8,6 +18,8 @@ First they will be checked and added if all checks pass.
 
 For each IP address a matching IP prefix will be searched for. First we look for the longest
 matching IP Prefix in the same site. If this failed we try to find the longest matching global IP Prefix.
+Exception (VMware strong sites): when the object site came from `host_site_relation` or a site-scoped
+prefix match, global prefix fallback is disabled and the IP is skipped if no site prefix matches.
 
 If an IP Prefix was found then we try to get the VRF and VLAN for this prefix. Now we compare
 if interface VLAN and prefix VLAN match up and warn if they don't. We also compare the

@@ -144,19 +144,24 @@ class VMWareConfig(ConfigBase):
                                              This is a quite important config setting as IP addresses, prefixes, VLANs
                                              and VRFs are site dependent. In order to assign the correct prefix to an IP
                                              address it is important to pick the correct site.
-                                             A VM always depends on the cluster site relation
                                              a cluster can be specified as "Cluster-name" or
                                              "Datacenter-name/Cluster-name" if multiple clusters have the same name.
-                                             When a vCenter cluster consists of hosts from multiple NetBox sites,
-                                             it is possible to leave the site for a NetBox cluster empty. All VMs from
-                                             this cluster will then also have no site reference.
-                                             The keyword "<NONE>" can be used as a value for this.
+                                             When unset, the cluster site may be inferred from unanimous host sites
+                                             (host_site_relation or longest site-scoped prefix of the host primary IP).
+                                             When hosts resolve to different sites, the cluster stays unscoped.
+                                             This option does not override per-host sites from host_site_relation or
+                                             prefix matching. VMs follow their parent host site.
+                                             The keyword "<NONE>" can be used as a value to leave the cluster unscoped.
                                              """,
                                              config_example="Cluster_NYC = New York, Cluster_FFM.* = Frankfurt, Datacenter_TOKIO/.* = Tokio, Cluster_MultiSite = <NONE>"),
                                 ConfigOption("host_site_relation",
                                              str,
-                                             description="""Same as cluster site but on host level.
-                                             If unset it will fall back to cluster_site_relation""",
+                                             description="""\
+                                             Same as cluster site but on host level.
+                                             If unset, the host site is taken from the longest site-scoped NetBox
+                                             prefix that contains the host primary IP, otherwise the default site
+                                             'vCenter: <source name>'. Cluster site no longer overrides the host.
+                                             """,
                                              config_example="nyc02.* = New York, ffm01.* = Frankfurt"),
                                 ConfigOption("cluster_scope_type_relation",
                                              str,

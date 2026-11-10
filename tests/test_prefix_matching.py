@@ -173,6 +173,36 @@ def test_an_ip_without_a_length_is_added_with_the_length_of_the_global_prefix(in
     assert inventory.get_by_data(NBIPAddress, data={"address": "10.40.232.163/22"}) is ip_objects[0]
 
 
+def test_strict_site_prefix_skips_ip_without_site_prefix(inventory, source, site):
+    add_prefix(inventory, "10.40.232.0/22")  # global only
+    vm, nic = vm_interface_at_site(inventory, source, site)
+    source._current_object_strict_site_prefix = True
+
+    ip_objects = sync_ip(source, vm, nic, "10.40.232.163/22")
+
+    assert ip_objects == []
+
+
+def test_strict_site_prefix_still_accepts_site_prefix(inventory, source, site):
+    add_prefix(inventory, "10.40.232.0/22", scope=("dcim.site", site.nb_id))
+    vm, nic = vm_interface_at_site(inventory, source, site)
+    source._current_object_strict_site_prefix = True
+
+    ip_objects = sync_ip(source, vm, nic, "10.40.232.163/22")
+
+    assert [str(ip.data.get("address")) for ip in ip_objects] == ["10.40.232.163/22"]
+
+
+def test_default_site_still_falls_back_to_global_prefix(inventory, source, site):
+    add_prefix(inventory, "10.40.232.0/22")
+    vm, nic = vm_interface_at_site(inventory, source, site)
+    source._current_object_strict_site_prefix = False
+
+    ip_objects = sync_ip(source, vm, nic, "10.40.232.163")
+
+    assert [str(ip.data.get("address")) for ip in ip_objects] == ["10.40.232.163/22"]
+
+
 def test_the_prefix_of_the_own_site_wins_over_the_global_one(inventory, source, site):
     site_vrf = inventory.add_object(NBVRF, data={"id": 2, "name": "site-vrf"}, read_from_netbox=True)
     inventory.add_object(NBVRF, data={"id": 3, "name": "global-vrf"}, read_from_netbox=True)
@@ -183,3 +213,33 @@ def test_the_prefix_of_the_own_site_wins_over_the_global_one(inventory, source, 
     ip_objects = sync_ip(source, vm, nic, "10.40.232.163/22")
 
     assert ip_objects[0].data.get("vrf") is site_vrf
+
+
+def find_site_scoped(source, ip):
+    source.inventory.resolve_relations()
+    return source.return_longest_site_scoped_prefix_for_ip(ip_address(ip))
+
+
+def test_site_scoped_lookup_returns_the_longest_site_prefix(inventory, source, site):
+    add_prefix(inventory, "10.40.0.0/16", scope=("dcim.site", site.nb_id))
+    longer = add_prefix(inventory, "10.40.232.0/22", scope=("dcim.site", site.nb_id))
+    add_prefix(inventory, "10.40.232.0/24")  # global — ignored
+
+    assert find_site_scoped(source, "10.40.232.163") is longer
+
+
+def test_site_scoped_lookup_ignores_global_and_site_group_prefixes(inventory, source, site):
+    group = inventory.add_object(NBSiteGroup, data={"id": 5, "name": "dc"}, read_from_netbox=True)
+    add_prefix(inventory, "10.40.232.0/22")
+    add_prefix(inventory, "10.40.232.0/23", scope=("dcim.sitegroup", group.nb_id))
+
+    assert find_site_scoped(source, "10.40.232.163") is None
+
+
+def test_site_scoped_lookup_returns_none_on_equal_length_tie(inventory, source):
+    site_a = inventory.add_object(NBSite, data={"id": 1, "name": "site-a"}, read_from_netbox=True)
+    site_b = inventory.add_object(NBSite, data={"id": 2, "name": "site-b"}, read_from_netbox=True)
+    add_prefix(inventory, "10.40.232.0/22", scope=("dcim.site", site_a.nb_id))
+    add_prefix(inventory, "10.40.232.0/22", scope=("dcim.site", site_b.nb_id))
+
+    assert find_site_scoped(source, "10.40.232.163") is None

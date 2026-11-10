@@ -300,6 +300,68 @@ class SourceBase:
 
         return current_longest_matching_prefix
 
+    def return_longest_site_scoped_prefix_for_ip(self, ip_to_match=None) -> Optional[NBPrefix]:
+        """
+        Find the longest matching prefix whose scope is a concrete NetBox site.
+
+        Global prefixes and site-group (or other non-site) scopes are ignored.
+        If two or more site-scoped prefixes share the same longest prefix length
+        but belong to different sites, return None (ambiguous).
+
+        Parameters
+        ----------
+        ip_to_match: IPv4Address, IPv6Address
+            IP address to find a site-scoped prefix for
+
+        Returns
+        -------
+        (NBPrefix, None): longest matching site-scoped prefix, or None
+        """
+
+        if ip_to_match is None or self.inventory is None:
+            return
+
+        if not isinstance(ip_to_match, (IPv4Address, IPv6Address)):
+            raise ValueError("Value of 'ip_to_match' needs to be an IPv4Address or IPv6Address object.")
+
+        current_longest_matching_prefix_length = -1
+        current_longest_matching_prefixes = list()
+
+        for prefix in self.inventory.get_all_items(NBPrefix):
+            scope_object = prefix.data.get("scope_id")
+            if not isinstance(scope_object, NBSite):
+                # NetBox < 4.2 stored site on the prefix directly
+                if not isinstance(prefix.data.get("site"), NBSite):
+                    continue
+                scope_object = prefix.data.get("site")
+
+            prefix_network = grab(prefix, f"data.{NBPrefix.primary_key}")
+            if prefix_network is None:
+                continue
+
+            if ip_to_match not in prefix_network:
+                continue
+
+            if prefix_network.prefixlen > current_longest_matching_prefix_length:
+                current_longest_matching_prefix_length = prefix_network.prefixlen
+                current_longest_matching_prefixes = [(prefix, scope_object)]
+            elif prefix_network.prefixlen == current_longest_matching_prefix_length:
+                current_longest_matching_prefixes.append((prefix, scope_object))
+
+        if len(current_longest_matching_prefixes) == 0:
+            return
+
+        site_ids = {grab(site, "nb_id") or id(site) for _, site in current_longest_matching_prefixes}
+        if len(site_ids) > 1:
+            site_names = sorted({site.get_display_name() for _, site in current_longest_matching_prefixes})
+            log.warning(
+                f"IP {ip_to_match} matches equally long site-scoped prefixes in multiple sites "
+                f"({', '.join(site_names)}). Treating as no match."
+            )
+            return
+
+        return current_longest_matching_prefixes[0][0]
+
     def add_update_interface(self, interface_object, device_object, interface_data, interface_ips=None,
                              vmware_object=None, keep_undiscovered_ips=False):
         """
@@ -355,7 +417,10 @@ class SourceBase:
 
         if type(device_object) == NBVM:
             interface_class = NBVMInterface
-            site_name = device_object_cluster.get_site_name()
+            # prefer the VM's own site (follows parent host); fall back to cluster site
+            site_name = device_object.get_site_name()
+            if site_name is None and device_object_cluster is not None:
+                site_name = device_object_cluster.get_site_name()
         elif type(device_object) == NBDevice:
             interface_class = NBInterface
             site_name = device_object.get_site_name()
@@ -463,12 +528,22 @@ class SourceBase:
             possible_ip_vrf = None
             prefix_tenant = None
 
+            # when the object's site came from config or a site-scoped prefix, do not
+            # fall back to a global prefix — skip the IP instead
+            strict_site_prefix = getattr(self, "_current_object_strict_site_prefix", False) is True
+
             # test for site prefixes first
             matching_ip_prefix = self.return_longest_matching_prefix_for_ip(ip_object, site_name)
 
-            # nothing was found then check prefixes without site name
-            if matching_ip_prefix is None:
+            # nothing was found then check prefixes without site name (unless strict)
+            if matching_ip_prefix is None and strict_site_prefix is False:
                 matching_ip_prefix = self.return_longest_matching_prefix_for_ip(ip_object)
+            elif matching_ip_prefix is None and strict_site_prefix is True:
+                log.warning(
+                    f"No matching site-scoped NetBox prefix for '{ip_object}' "
+                    f"({interface_object.get_display_name()}) in site '{site_name}'. Skipping IP."
+                )
+                continue
 
             # matching prefix found, get data from prefix
             if matching_ip_prefix is not None:
